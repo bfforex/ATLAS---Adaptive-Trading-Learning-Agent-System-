@@ -1,7 +1,8 @@
 """
-ATLAS V2 Main Entrypoint (Production Ready, Live XMGlobal MT5 Mode)
-===================================================================
-CLI orchestrator for: training, evaluation, simulation, backtest, forwardtest, and live trading
+ATLAS V2 Main Entrypoint (Production, Monitor Integrated)
+=========================================================
+Full CLI orchestrator for: train, evaluate, simulate, backtest, forwardtest, trade (live with MT5).
+Integrates AtlasSystemMonitor for agent/system/risk safety in live trading.
 """
 
 import argparse
@@ -12,7 +13,7 @@ from datetime import datetime
 import json
 import os
 
-from atlas_v2_config import ATLASConfig  # edit if your loader differs
+from atlas_v2_config import ATLASConfig
 from atlas_v2_data import prepare_dataloaders, ATLASDataLoader
 from atlas_v2_training import train_model, ATLASLightningModule
 from atlas_v2_evaluation import ComprehensiveEvaluator
@@ -21,6 +22,13 @@ from atlas_v2_simulation import MarketDataProvider, LiveTradingSimulator
 from atlas_v2_backtest import Backtester
 from atlas_v2_forwardtest import ForwardTester
 from atlas_v2_live_mt5 import MT5Connector, LiveTradingMT5Loop
+from atlas_v2_monitor import AtlasMonitorConfig  # <-- import monitor config
+
+# --- Optional Alert Callback ---
+def send_alert(msg):
+    # Extend: email, Slack, SMS, etc.
+    print(f"[ALERT] {msg}")
+    # For notification: integrate with ops alerting stack here
 
 def print_banner(run_name):
     print("=" * 70)
@@ -40,7 +48,6 @@ def parse_dynamic_overrides(override_list):
             print(f"[WARN] Invalid override: {kv}")
             continue
         key, value = kv.split('=', 1)
-        # Try to interpret as float/int/bool if possible
         try:
             if value.lower() in ('true', 'false'):
                 v = value.lower() == 'true'
@@ -70,7 +77,6 @@ def load_config(config_path=None, overrides=None):
     return config
 
 def validate_config_and_data(config):
-    missing = []
     for s in getattr(config, 'symbols', []):
         data_path = Path('data/raw') / f"{s}.csv"
         if not data_path.exists():
@@ -97,7 +103,7 @@ def save_full_config(run_dir, config):
     print(f"[INFO] Config snapshot written to {config_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="ATLAS V2 Modular Trading System (Production CLI)")
+    parser = argparse.ArgumentParser(description="ATLAS V2 System (Production + Monitor)")
     parser.add_argument("command", choices=["train", "simulate", "backtest", "forwardtest", "evaluate", "trade"], help="Run mode")
     parser.add_argument("--name", type=str, help="Run name/label for outputs")
     parser.add_argument("--config", type=str, help="Config JSON to load")
@@ -113,6 +119,12 @@ def main():
     parser.add_argument("--mt5-server", type=str, help="[trade] MT5 server name e.g. 'XMGlobal-MT5'")
     parser.add_argument("--mt5-lot-size", type=float, help="[trade] Order lot size (default: 0.1)")
     parser.add_argument("--mt5-interval", type=int, default=60, help="[trade] Trade/check frequency in seconds (default: 60)")
+    # Monitor CLI thresholds
+    parser.add_argument("--monitor-max-drawdown", type=float, help="Monitor max drawdown allowed (e.g. 0.2 is 20%)")
+    parser.add_argument("--monitor-min-sharpe", type=float, help="Monitor min Sharpe ratio required")
+    parser.add_argument("--monitor-min-equity", type=float, help="Monitor min equity allowed (default: 1000)")
+    parser.add_argument("--monitor-max-naninf", type=int, help="Monitor max consecutive NaN/inf signals before halt")
+    parser.add_argument("--monitor-min-hold", type=int, help="Monitor minimum hold period for position (hysteresis)")
 
     args = parser.parse_args()
     run_name = args.name or (args.output if args.output else None)
@@ -187,6 +199,19 @@ def main():
             print("[ERROR] --mt5-login, --mt5-password, and --mt5-server are required for live trading.")
             sys.exit(1)
         lot_size = args.mt5_lot_size or 0.1
+        # --- Set up monitor config from CLI ---
+        monitor_config = AtlasMonitorConfig()
+        if args.monitor_max_drawdown is not None:
+            monitor_config.max_drawdown = float(args.monitor_max_drawdown)
+        if args.monitor_min_sharpe is not None:
+            monitor_config.min_sharpe = float(args.monitor_min_sharpe)
+        if args.monitor_min_equity is not None:
+            monitor_config.min_equity = float(args.monitor_min_equity)
+        if args.monitor_max_naninf is not None:
+            monitor_config.max_nan_inf = int(args.monitor_max_naninf)
+        if args.monitor_min_hold is not None:
+            monitor_config.min_hold_time = int(args.monitor_min_hold)
+        # ---
         connector = MT5Connector(
             login=args.mt5_login,
             password=args.mt5_password,
@@ -196,12 +221,15 @@ def main():
         )
         model = ATLASLightningModule.load_from_checkpoint(args.checkpoint, config=config)
         live_loop = LiveTradingMT5Loop(
-            model, config, connector, run_dir=run_dir, interval_sec=args.mt5_interval
+            model, config, connector, run_dir=run_dir,
+            interval_sec=args.mt5_interval,
+            monitor_config=monitor_config,
+            alert_callback=send_alert
         )
         print(f"[INFO] Starting live trading on XMGlobal MT5. (logs at {run_dir})")
         print(
             "[WARNING] This module places REAL ORDERS. Validate demo/paper performance before going live.\n"
-            "If you see errors, check account mode, symbols, internet, and broker status."
+            "If you see errors, check account mode, symbols, internet, broker."
         )
         steps = args.steps if args.steps else None
         try:
