@@ -1,3 +1,9 @@
+"""
+ATLAS V2 Main Entrypoint (Production Ready, Live XMGlobal MT5 Mode)
+===================================================================
+CLI orchestrator for: training, evaluation, simulation, backtest, forwardtest, and live trading
+"""
+
 import argparse
 import sys
 import logging
@@ -6,34 +12,20 @@ from datetime import datetime
 import json
 import os
 
-from atlas_v2_config import ATLASConfig  # Must customize if not matching prototype
+from atlas_v2_config import ATLASConfig  # edit if your loader differs
 from atlas_v2_data import prepare_dataloaders, ATLASDataLoader
 from atlas_v2_training import train_model, ATLASLightningModule
 from atlas_v2_evaluation import ComprehensiveEvaluator
 from atlas_v2_memory import ConfigSnapshotManager
 from atlas_v2_simulation import MarketDataProvider, LiveTradingSimulator
-
-try:
-    from tqdm import tqdm
-except ImportError:
-    tqdm = None  # Safe fallback
-
-def get_git_commit_info():
-    # Print Git commit info for full reproducibility, if in a repo.
-    try:
-        import subprocess
-        commit = subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode().strip()
-        dirty = subprocess.call(['git', 'diff-index', '--quiet', 'HEAD']) != 0
-        return commit + (" (uncommitted changes)" if dirty else "")
-    except Exception:
-        return "unknown"
+from atlas_v2_backtest import Backtester
+from atlas_v2_forwardtest import ForwardTester
+from atlas_v2_live_mt5 import MT5Connector, LiveTradingMT5Loop
 
 def print_banner(run_name):
     print("=" * 70)
-    print("ATLAS V2 Modular ML Trading System")
+    print("ATLAS V2 Modular Trading System")
     print(f"Run: {run_name}")
-    print(f"Git commit: {get_git_commit_info()}")
-    print(f"Python: {sys.version.split()[0]}")
     print(f"Timestamp: {datetime.now()}")
     print("=" * 70)
 
@@ -42,14 +34,13 @@ def friendly_error(msg):
     sys.exit(1)
 
 def parse_dynamic_overrides(override_list):
-    # --set key1=val1 --set key2=val2 ... turns into {key1: val1,...}
     updates = {}
     for kv in override_list:
         if '=' not in kv:
             print(f"[WARN] Invalid override: {kv}")
             continue
         key, value = kv.split('=', 1)
-        # Try to interpret as float/int/bool if possible; else str
+        # Try to interpret as float/int/bool if possible
         try:
             if value.lower() in ('true', 'false'):
                 v = value.lower() == 'true'
@@ -64,7 +55,6 @@ def parse_dynamic_overrides(override_list):
     return updates
 
 def load_config(config_path=None, overrides=None):
-    # Load and apply in-order: config file, then --set key=val
     if config_path and Path(config_path).exists():
         config = ATLASConfig.load(config_path)
         print(f"[INFO] Loaded config: {config_path}")
@@ -80,7 +70,6 @@ def load_config(config_path=None, overrides=None):
     return config
 
 def validate_config_and_data(config):
-    # Minimal check for file/dataset availability
     missing = []
     for s in getattr(config, 'symbols', []):
         data_path = Path('data/raw') / f"{s}.csv"
@@ -92,8 +81,7 @@ def validate_config_and_data(config):
             if not torch.cuda.is_available():
                 friendly_error("Configured device=cuda but no GPU detected!")
         except ImportError:
-            friendly_error("torch is required for CUDA support")
-    # Add more as needed (feature_size, batch_size, limits...)
+            friendly_error("torch is required for CUDA support.")
 
 def ensure_run_dir(name):
     name = name or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -109,31 +97,33 @@ def save_full_config(run_dir, config):
     print(f"[INFO] Config snapshot written to {config_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="ATLAS V2 Modular Trading System (Best UX Features)")
-    parser.add_argument("command", choices=["train", "simulate", "evaluate"], help="Run mode")
+    parser = argparse.ArgumentParser(description="ATLAS V2 Modular Trading System (Production CLI)")
+    parser.add_argument("command", choices=["train", "simulate", "backtest", "forwardtest", "evaluate", "trade"], help="Run mode")
     parser.add_argument("--name", type=str, help="Run name/label for outputs")
     parser.add_argument("--config", type=str, help="Config JSON to load")
     parser.add_argument("--set", nargs="*", default=[], help="Override config values, e.g. --set learning_rate=0.0002 batch_size=256")
-    parser.add_argument("--steps", type=int, help="Simulation steps (simulate)")
-    parser.add_argument("--checkpoint", type=str, help="Checkpoint path (simulate/evaluate)")
+    parser.add_argument("--steps", type=int, help="Number of steps (simulate/backtest/forwardtest/trade)")
+    parser.add_argument("--checkpoint", type=str, help="Checkpoint path")
     parser.add_argument("--output", type=str, help="Custom output directory (overrides --name)")
     parser.add_argument("--epochs", type=int, help="Epoch override (train)")
-    parser.add_argument("--device", type=str, help="device override (train/sim/eval)")
+    parser.add_argument("--device", type=str, help="Device override (train/sim/eval)")
+    # MT5/XMGlobal-specific login for live mode
+    parser.add_argument("--mt5-login", type=int, help="[trade] MT5 login (account number)")
+    parser.add_argument("--mt5-password", type=str, help="[trade] MT5 password")
+    parser.add_argument("--mt5-server", type=str, help="[trade] MT5 server name e.g. 'XMGlobal-MT5'")
+    parser.add_argument("--mt5-lot-size", type=float, help="[trade] Order lot size (default: 0.1)")
+    parser.add_argument("--mt5-interval", type=int, default=60, help="[trade] Trade/check frequency in seconds (default: 60)")
 
     args = parser.parse_args()
     run_name = args.name or (args.output if args.output else None)
     run_dir = ensure_run_dir(run_name)
-
     print_banner(run_name or str(run_dir.name))
 
-    # Step 1: Load config, apply CLI --set overrides
     cli_overrides = parse_dynamic_overrides(args.set)
     config = load_config(args.config, cli_overrides)
     if args.epochs: setattr(config, "num_epochs", args.epochs)
     if args.device: setattr(config, "device", args.device)
     save_full_config(run_dir, config)
-
-    # Step 2: Preflight validation and warnings
     validate_config_and_data(config)
 
     if args.command == "train":
@@ -141,19 +131,16 @@ def main():
         train_loader, val_loader, test_loader, _ = prepare_dataloaders(config)
         print("[INFO] Starting training ...")
         try:
-            from tqdm import tqdm
             model, trainer = train_model(config, train_loader, val_loader, test_loader)
         except Exception as e:
             friendly_error(f"Training failed: {e}")
         print("[SUCCESS] Training complete.")
-        # Print out checkpoint dir and best val metric
         print(f"[INFO] Checkpoints saved in: {config.memory_dir}/checkpoints/")
         print(f"[INFO] See run artifacts at {run_dir}")
 
     elif args.command == "evaluate":
         if not args.checkpoint:
             friendly_error("You must specify a --checkpoint for evaluation!")
-        # Evaluation/prediction
         _, _, test_loader, _ = prepare_dataloaders(config)
         print(f"[INFO] Loading model from checkpoint: {args.checkpoint}")
         model = ATLASLightningModule.load_from_checkpoint(args.checkpoint, config=config)
@@ -164,11 +151,8 @@ def main():
         with open(report_path, "w") as f:
             f.write(evaluator.generate_report(results))
         print(f"[SUCCESS] Evaluation complete. Report written to: {report_path}")
-        print("[INFO] Next step: Visualize results, compare with other runs, etc.")
 
     elif args.command == "simulate":
-        if not args.checkpoint:
-            friendly_error("You must specify a --checkpoint for simulation!")
         assets_data, _ = ATLASDataLoader.load_multi_asset(config.symbols, config.feature_size)
         provider = MarketDataProvider(config.symbols, assets_data)
         model = ATLASLightningModule.load_from_checkpoint(args.checkpoint, config=config)
@@ -178,10 +162,58 @@ def main():
         simulator.run(n_steps=steps)
         print("[SUCCESS] Simulation complete.")
         print(f"[INFO] Results/logs at {simulator.results_dir}")
+
+    elif args.command == "backtest":
+        assets_data, _ = ATLASDataLoader.load_multi_asset(config.symbols, config.feature_size)
+        provider = MarketDataProvider(config.symbols, assets_data)
+        model = ATLASLightningModule.load_from_checkpoint(args.checkpoint, config=config)
+        bt = Backtester(model, config, provider, result_dir=run_dir, name=args.name)
+        steps = args.steps if args.steps else None
+        bt.run(end=steps)
+        print(f"[SUCCESS] Backtest complete. Logs at {bt.result_dir}")
+
+    elif args.command == "forwardtest":
+        assets_data, _ = ATLASDataLoader.load_multi_asset(config.symbols, config.feature_size)
+        provider = MarketDataProvider(config.symbols, assets_data)
+        model = ATLASLightningModule.load_from_checkpoint(args.checkpoint, config=config)
+        fwd = ForwardTester(model, config, provider, result_dir=run_dir, name=args.name)
+        steps = args.steps if args.steps else len(provider)
+        fwd.run(steps)
+        print(f"[SUCCESS] Forward test complete. Logs at {fwd.result_dir}")
+
+    elif args.command == "trade":
+        print("[PRODUCTION SAFETY] Make sure you are running on DEMO ACCOUNT, and only switch to LIVE after extensive testing!")
+        if not (args.mt5_login and args.mt5_password and args.mt5_server):
+            print("[ERROR] --mt5-login, --mt5-password, and --mt5-server are required for live trading.")
+            sys.exit(1)
+        lot_size = args.mt5_lot_size or 0.1
+        connector = MT5Connector(
+            login=args.mt5_login,
+            password=args.mt5_password,
+            server=args.mt5_server,
+            symbols=config.symbols,
+            lot_size=lot_size,
+        )
+        model = ATLASLightningModule.load_from_checkpoint(args.checkpoint, config=config)
+        live_loop = LiveTradingMT5Loop(
+            model, config, connector, run_dir=run_dir, interval_sec=args.mt5_interval
+        )
+        print(f"[INFO] Starting live trading on XMGlobal MT5. (logs at {run_dir})")
+        print(
+            "[WARNING] This module places REAL ORDERS. Validate demo/paper performance before going live.\n"
+            "If you see errors, check account mode, symbols, internet, and broker status."
+        )
+        steps = args.steps if args.steps else None
+        try:
+            live_loop.run(n_steps=steps)
+        except KeyboardInterrupt:
+            print("[USER] Interrupted live trading, session ending.")
+        print("[INFO] Live trading session ended.")
+        print(f"[INFO] Logs: {run_dir}")
+
     else:
         friendly_error("Unknown command. Use --help for options.")
 
-    # Print run summary and pointing to outputs  
     print("\n=== RUN COMPLETE ===")
     print(f"Config snapshot: {run_dir / 'active_config.json'}")
     print(f"Outputs/logs: {run_dir}")
