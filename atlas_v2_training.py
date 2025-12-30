@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple
 import logging
 from datetime import datetime
 
-from models import ATLASModel
+from V2_models import ATLASModel
 
 logger = logging.getLogger(__name__)
 
